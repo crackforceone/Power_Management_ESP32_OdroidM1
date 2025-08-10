@@ -45,6 +45,12 @@ static bool isInitialPowerOn = true;      // Track if this is initial power-on
 static unsigned long powerOnTime = 0;     // Track when system powered on
 static bool waitingForIgnition = false;   // Track if we're waiting for ignition after power-on
 
+// NEW: RadioON state tracking to prevent shutdown during engine start
+static bool lastRadioONState = false;    // Track previous RadioON state
+static unsigned long radioONLowStartTime = 0;  // When RadioON went LOW
+static bool radioONLowTimerActive = false;
+static const unsigned long RADIO_LOW_GRACE_MS = 5000;  // 5 seconds grace for engine start
+
 // Simplified CAN state management - no queue needed
 TaskHandle_t canTaskHandle;
 volatile bool canStateChanged = false;
@@ -217,6 +223,80 @@ bool isInInitialWakePeriod() {
   return initialWakeTimerActive;
 }
 
+// NEW: Function to check if RadioON LOW should be ignored due to ignition state
+bool shouldIgnoreRadioONLow() {
+  // Always ignore RadioON LOW if ignition is active
+  if (isIgnitionActive()) {
+    Serial.printf("RadioON LOW ignored - ignition active (CAN state: 0x%02X)\n", currentCANState);
+    return true;
+  }
+  
+  // If we're in initial wake period, also ignore
+  if (isInInitialWakePeriod()) {
+    Serial.println("RadioON LOW ignored - in initial wake period");
+    return true;
+  }
+  
+  return false;
+}
+
+// NEW: Function to monitor RadioON transitions
+void monitorRadioONTransitions() {
+  bool currentRadioON = digitalRead(RadioON) == HIGH;
+  
+  // Detect RadioON state changes
+  if (currentRadioON != lastRadioONState) {
+    if (!currentRadioON) {
+      // RadioON went LOW
+      Serial.printf("RadioON transition: HIGH -> LOW (ignition active: %s)\n", 
+                    isIgnitionActive() ? "YES" : "NO");
+      
+      if (shouldIgnoreRadioONLow()) {
+        // Start a grace timer for temporary RadioON LOW during ignition
+        radioONLowStartTime = millis();
+        radioONLowTimerActive = true;
+        Serial.println("Starting RadioON LOW grace period (ignition active)");
+      }
+    } else {
+      // RadioON went HIGH
+      Serial.println("RadioON transition: LOW -> HIGH");
+      if (radioONLowTimerActive) {
+        Serial.println("RadioON back HIGH - cancelling LOW grace period");
+        radioONLowTimerActive = false;
+      }
+    }
+    lastRadioONState = currentRadioON;
+  }
+  
+  // Check RadioON LOW grace timer
+  if (radioONLowTimerActive) {
+    unsigned long elapsed = millis() - radioONLowStartTime;
+    
+    // If RadioON comes back HIGH, cancel the timer
+    if (currentRadioON) {
+      Serial.println("RadioON back HIGH during grace period - timer cancelled");
+      radioONLowTimerActive = false;
+    }
+    // If ignition goes OFF during RadioON LOW, start shutdown immediately
+    else if (!isIgnitionActive()) {
+      Serial.println("Ignition went OFF during RadioON LOW - starting shutdown");
+      radioONLowTimerActive = false;
+      handleIgnitionOff();
+    }
+    // If grace period expires and ignition is still ON, keep running normally
+    else if (elapsed >= RADIO_LOW_GRACE_MS) {
+      if (isIgnitionActive()) {
+        Serial.println("RadioON LOW grace period expired - ignition still active, continuing normal operation");
+        radioONLowTimerActive = false;
+      } else {
+        Serial.println("RadioON LOW grace period expired - ignition OFF, starting shutdown");
+        radioONLowTimerActive = false;
+        handleIgnitionOff();
+      }
+    }
+  }
+}
+
 // Power-on sequence handling
 void handlePowerOnSequence() {
   // Only trigger power-on sequence once
@@ -241,17 +321,17 @@ void handlePowerOnSequence() {
   }
 }
 
-// MODIFIED: Handle RadioON going LOW while waiting for ignition - but respect initial wake timer
+// MODIFIED: Handle RadioON going LOW while waiting for ignition - but respect initial wake timer AND ignition state
 void handleRadioOffWhileWaitingForIgnition() {
   if (waitingForIgnition && digitalRead(RadioON) == LOW && digitalRead(ALIVE) == HIGH) {
     
-    // NEW: Check if we're still in initial wake period
-    if (isInInitialWakePeriod()) {
-      Serial.println("=== RADIO OFF DURING INITIAL WAKE PERIOD ===");
-      Serial.printf("RadioON went LOW but still in 120s wake period (RadioON: %d, ALIVE: %d)\n",
-                    digitalRead(RadioON), digitalRead(ALIVE));
-      Serial.println("Ignoring RadioON LOW - staying awake due to initial wake timer");
-      return;  // Don't start shutdown - initial wake timer is still active
+    // NEW: Check if we should ignore this RadioON LOW
+    if (shouldIgnoreRadioONLow()) {
+      Serial.println("=== RADIO OFF IGNORED DURING IGNITION ===");
+      Serial.printf("RadioON went LOW but ignition active or in wake period (RadioON: %d, ALIVE: %d, CAN: 0x%02X)\n",
+                    digitalRead(RadioON), digitalRead(ALIVE), currentCANState);
+      Serial.println("Ignoring RadioON LOW - staying awake");
+      return;  // Don't start shutdown
     }
     
     Serial.println("=== RADIO OFF WHILE WAITING FOR IGNITION ===");
@@ -310,6 +390,12 @@ void handleIgnitionOn() {
     Serial.println("Ignition back ON - Grace period cancelled");
   }
   
+  // Cancel RadioON LOW grace period if active
+  if (radioONLowTimerActive) {
+    radioONLowTimerActive = false;
+    Serial.println("Ignition ON - RadioON LOW grace period cancelled");
+  }
+  
   // If we were waiting for ignition after power-on, we're now in normal operation
   if (waitingForIgnition) {
     waitingForIgnition = false;
@@ -329,23 +415,39 @@ void handleIgnitionOn() {
   isInitialPowerOn = false;  // No longer initial power-on
 }
 
-// FIXED: Enhanced USB state management
+// MODIFIED: Enhanced USB state management - respect ignition state
 void updateUSBState() {
   bool radioOnHigh = digitalRead(RadioON) == HIGH;
   bool usbOffCurrent = digitalRead(USBOFF) == HIGH;
+  
+  // NEW: If ignition is active, keep USB on even if RadioON is temporarily low
+  if (isIgnitionActive() && !radioOnHigh) {
+    Serial.printf("USB staying ON - ignition active despite RadioON LOW (CAN: 0x%02X)\n", currentCANState);
+    if (!usbOffCurrent) {
+      digitalWrite(USBOFF, HIGH);
+      Serial.println("Setting USBOFF HIGH (ignition active)");
+    }
+    return;
+  }
 
-  // Set USBOFF high when RadioON is high, low when RadioON is low
+  // Normal USB state management based on RadioON
   if (radioOnHigh && !usbOffCurrent) {
     digitalWrite(USBOFF, HIGH);
     Serial.println("Setting USBOFF HIGH (RadioON active)");
-  } else if (!radioOnHigh && usbOffCurrent) {
+  } else if (!radioOnHigh && usbOffCurrent && !isIgnitionActive()) {
     digitalWrite(USBOFF, LOW);
     Serial.println("Setting USBOFF LOW (RadioON inactive)");
   }
 }
 
-// New function to handle DisplayOFF based on ignition state
+// MODIFIED: New function to handle DisplayOFF based on ignition state - keep on during engine start
 void setDisplayLow(const char* reason) {
+  // NEW: Don't turn off display if ignition is active (engine starting)
+  if (isIgnitionActive()) {
+    Serial.printf("Display staying ON - ignition active: %s (CAN: 0x%02X)\n", reason, currentCANState);
+    return;
+  }
+  
   if (digitalRead(DisplayOFF) == HIGH) {
     digitalWrite(DisplayOFF, LOW);
     Serial.printf("Setting DisplayOFF LOW: %s\n", reason);
@@ -359,12 +461,22 @@ void setDisplayHighIfIgnitionActive(const char* reason) {
       Serial.printf("Setting DisplayOFF HIGH: %s\n", reason);
     }
   } else {
-    setDisplayLow("Ignition OFF");
+    // Only turn off if ignition is truly inactive
+    if (digitalRead(DisplayOFF) == HIGH) {
+      digitalWrite(DisplayOFF, LOW);
+      Serial.printf("Setting DisplayOFF LOW: %s (ignition inactive)\n", reason);
+    }
   }
 }
 
-// Function to set outputs low before sleep (includes CANOFF)
+// MODIFIED: Function to set outputs low before sleep - but check ignition first
 void setOutputsLowForSleep() {
+  // NEW: Don't turn off outputs if ignition is still active
+  if (isIgnitionActive()) {
+    Serial.printf("NOT setting outputs low - ignition still active (CAN: 0x%02X)\n", currentCANState);
+    return;
+  }
+  
   digitalWrite(USBOFF, LOW);
   digitalWrite(DisplayOFF, LOW);
   digitalWrite(CANOFF, LOW);  // Pull CANOFF low before sleep
@@ -379,7 +491,14 @@ void setCANOFFHigh() {
   }
 }
 
+// MODIFIED: Prevent power cycle if ignition is active
 void handlePowerCycle() {
+  // NEW: Don't power cycle if ignition is active
+  if (isIgnitionActive()) {
+    Serial.printf("Power cycle PREVENTED - ignition active (CAN: 0x%02X)\n", currentCANState);
+    return;
+  }
+  
   Serial.println("Executing power cycle...");
   digitalWrite(PWR, LOW);
   delay(250);
@@ -404,6 +523,17 @@ void triggerPWR() {
 // ENHANCED: Grace period handling with PWR retry logic
 void checkGracePeriod() {
   if (!ignitionOffTimerActive) return;
+  
+  // NEW: Cancel grace period if ignition becomes active again
+  if (isIgnitionActive()) {
+    Serial.printf("Grace period CANCELLED - ignition became active (CAN: 0x%02X)\n", currentCANState);
+    ignitionOffTimerActive = false;
+    isRetryAttempt = false;
+    lastDebugTime = 0;
+    pwrTriggerCount = 0;
+    lastPwrTriggerTime = 0;
+    return;
+  }
   
   // Use different timeout periods for initial attempt vs retries
   unsigned long timeoutPeriod = isRetryAttempt ? RETRY_PERIOD_MS : GRACE_PERIOD_MS;
@@ -435,10 +565,10 @@ void checkGracePeriod() {
     
     unsigned long timeSinceLastPwr = pwrTriggerCount > 0 ? (millis() - lastPwrTriggerTime) : 0;
     
-    Serial.printf("%s period: %lu/%lu ms (RadioON: %d, ALIVE: %d, PWR count: %d, Time since PWR: %lu ms)\n", 
+    Serial.printf("%s period: %lu/%lu ms (RadioON: %d, ALIVE: %d, PWR count: %d, Time since PWR: %lu ms, CAN: 0x%02X)\n", 
                   periodType, elapsed, timeoutPeriod,
                   digitalRead(RadioON), digitalRead(ALIVE),
-                  pwrTriggerCount, timeSinceLastPwr);
+                  pwrTriggerCount, timeSinceLastPwr, currentCANState);
     lastDebugTime = millis();
   }
   
@@ -465,9 +595,24 @@ bool isIgnitionActive() {
   }
 }
 
-// ENHANCED: Shutdown sequence with PWR retry mechanism
+// MODIFIED: Shutdown sequence with ignition state checking
 void triggerShutdownSequence() {
   Serial.println("=== EXECUTING SHUTDOWN SEQUENCE ===");
+
+  // NEW: Final check - don't shutdown if ignition became active
+  if (isIgnitionActive()) {
+    Serial.printf("SHUTDOWN ABORTED - ignition became active (CAN: 0x%02X)\n", currentCANState);
+    ignitionOffTimerActive = false;
+    isRetryAttempt = false;
+    lastDebugTime = 0;
+    pwrTriggerCount = 0;
+    lastPwrTriggerTime = 0;
+    updateUSBState();
+    setDisplayHighIfIgnitionActive("Ignition active during shutdown attempt");
+    setCANOFFHigh();
+    Serial.println("=== SHUTDOWN SEQUENCE ABORTED ===");
+    return;
+  }
 
   setOutputsLowForSleep();
 
@@ -560,7 +705,7 @@ SystemState getSystemState() {
   return STATE_FULL_ACTIVE;
 }
 
-// MODIFIED: Enhanced setup function with initial wake timer initialization
+// MODIFIED: Enhanced setup function with RadioON state tracking
 void setup() {
   setCpuFrequencyMhz(80);
 
@@ -581,6 +726,11 @@ void setup() {
   isInitialPowerOn = true;
   waitingForIgnition = false;
   powerOnTime = millis();
+  
+  // NEW: Initialize RadioON state tracking
+  lastRadioONState = digitalRead(RadioON) == HIGH;
+  radioONLowStartTime = 0;
+  radioONLowTimerActive = false;
   
   // NEW: Initialize initial wake timer variables
   initialWakeTimerActive = false;
@@ -625,9 +775,10 @@ void setup() {
 
   Serial.println("Setup complete - CAN monitoring active");
   Serial.println("Wake-up configured for RadioON (GPIO 4) or ALIVE (GPIO 26)");
+  Serial.println("RadioON LOW protection active - will not shutdown during engine start if ignition is ON");
 }
 
-// MODIFIED: Enhanced main loop with initial wake timer priority
+// MODIFIED: Enhanced main loop with RadioON transition monitoring
 void loop() {
   // Ensure CANOFF is HIGH when system is awake
   setCANOFFHigh();
@@ -635,10 +786,13 @@ void loop() {
   // Process CAN state changes (only when they occur)
   processCANStateChange();
 
-  // Update USB state based on RadioON - ALWAYS call this
+  // NEW: HIGHEST PRIORITY - Monitor RadioON transitions to detect engine start
+  monitorRadioONTransitions();
+
+  // Update USB state based on RadioON and ignition state - ALWAYS call this
   updateUSBState();
 
-  // NEW: HIGHEST PRIORITY - Check initial wake timer first
+  // NEW: Check initial wake timer
   checkInitialWakeTimer();
   
   // If we're in initial wake period, skip most other logic
@@ -664,7 +818,7 @@ void loop() {
     handlePowerOnSequence();
   }
   
-  // Handle RadioON going LOW while waiting for ignition (only if not in wake period)
+  // Handle RadioON going LOW while waiting for ignition (only if not in wake period and not protected by ignition)
   handleRadioOffWhileWaitingForIgnition();
 
   // PRIORITY: Check grace period timer - this can override normal state management
@@ -698,7 +852,7 @@ void loop() {
     case STATE_ALIVE_ONLY:
       setDisplayLow("State: 01 - ALIVE only");
       if (digitalRead(ALIVE) == HIGH) {
-        handlePowerCycle();
+        handlePowerCycle();  // This now checks ignition state before power cycling
       }
       break;
 
@@ -709,7 +863,7 @@ void loop() {
         setDisplayHighIfIgnitionActive("State: 10 - RadioON active");
       }
       if (digitalRead(ALIVE) == LOW) {
-        handlePowerCycle();
+        handlePowerCycle();  // This now checks ignition state before power cycling
       }
       break;
 
